@@ -1,0 +1,184 @@
+
+
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import pybamm
+
+warnings.filterwarnings("ignore")
+
+# ── 1. Model ──────────────────────────────────────────────────────────────────
+options = {
+    "SEI"                     : "solvent-diffusion limited",
+    "SEI porosity change"     : "false",
+    "lithium plating"         : "none",
+    "particle mechanics"      : "none",
+    "loss of active material" : "none",
+}
+model = pybamm.lithium_ion.DFN(options=options)
+
+# ── 2. Sodium-ion parameter overrides (Table 1 & 2) ──────────────────────────
+import pybamm
+
+# --------------------------------------------------
+# Base parameter sets
+# --------------------------------------------------
+param = pybamm.ParameterValues("Chen2020")
+param.update(pybamm.ParameterValues("Chayambuka2022"))
+
+# --------------------------------------------------
+# Geometry
+# --------------------------------------------------
+param.update({
+    "Negative electrode thickness [m]": 64e-6,
+    "Positive electrode thickness [m]": 68e-6,
+    "Separator thickness [m]": 25e-6,
+    "Electrode height [m]": 0.0159,
+    "Electrode width [m]": 0.0159,
+})
+
+# --------------------------------------------------
+# Negative electrode (Hard Carbon)
+# --------------------------------------------------
+param.update({
+    "Negative electrode active material volume fraction": 1 - 0.51 - 0.001,
+    "Negative electrode porosity": 0.51,
+    "Negative particle radius [m]": 3.48e-6,
+    "Maximum concentration in negative electrode [mol.m-3]": 14540.0,
+    "Initial concentration in negative electrode [mol.m-3]": 14520.0,
+    "Negative electrode conductivity [S.m-1]": 256.0,
+    "Negative electrode Bruggeman coefficient (electrolyte)": 1.5,
+    "Negative electrode Bruggeman coefficient (electrode)": 1.5,
+})
+
+# --------------------------------------------------
+# Positive electrode (NVPF)
+# --------------------------------------------------
+param.update({
+    "Positive electrode active material volume fraction": 1 - 0.23 - 0.22,
+    "Positive electrode porosity": 0.23,
+    "Positive particle radius [m]": 0.59e-6,
+    "Maximum concentration in positive electrode [mol.m-3]": 15320.0,
+    "Initial concentration in positive electrode [mol.m-3]": 3320.0,
+    "Positive electrode conductivity [S.m-1]": 50.0,
+    "Positive electrode Bruggeman coefficient (electrolyte)": 1.5,
+    "Positive electrode Bruggeman coefficient (electrode)": 1.5,
+})
+
+# --------------------------------------------------
+# Electrolyte (1 M NaPF6 in EC:PC)
+# --------------------------------------------------
+param.update({
+    "Separator porosity": 0.55,
+    "Cation transference number": 0.45,
+    "Initial concentration in electrolyte [mol.m-3]": 1000.0,
+})
+
+# --------------------------------------------------
+# Cell
+# --------------------------------------------------
+param.update({
+    "Nominal cell capacity [A.h]": 2.8e-3,
+    "Lower voltage cutoff [V]": 2.0,
+    "Upper voltage cutoff [V]": 4.15,
+    "Ambient temperature [K]": 298.15,
+    "Initial temperature [K]": 298.15,
+})
+
+# --------------------------------------------------
+# SEI (Solvent-Diffusion Limited Model)
+# --------------------------------------------------
+param.update({
+    "SEI solvent diffusivity [m2.s-1]": 80.5e-24,
+    "SEI partial molar volume [m3.mol-1]": 5.72e-5,
+    "SEI resistivity [Ohm.m]": 2e5,
+    "Bulk solvent concentration [mol.m-3]": 7500.0,
+    "Initial inner SEI thickness [m]": 0.5e-9,
+    "Initial outer SEI thickness [m]": 0.5e-9,
+})
+
+# ── 3. Experiment – 50 cycles ─────────────────────────────────────────────────
+N_CYCLES = 800
+experiment = pybamm.Experiment(
+    [
+        (
+            "Discharge at 1C until 2.0V",
+            "Rest for 5 minutes",
+            "Charge at 1C until 4.15V",
+            "Hold at 4.15V until C/50",
+            "Rest for 5 minutes",
+        )
+    ] * N_CYCLES,
+    termination="80% capacity",
+)
+
+# ── 4. Solver ─────────────────────────────────────────────────────────────────
+try:
+    solver = pybamm.IDAKLUSolver(atol=1e-4, rtol=1e-4)
+    print("Using IDAKLUSolver")
+except Exception:
+    solver = pybamm.CasadiSolver(
+        mode="safe", atol=1e-4, rtol=1e-4,
+        extra_options={"max_num_steps": 20000},
+    )
+    print("Using CasadiSolver (IDAKLU not available)")
+
+sim = pybamm.Simulation(model, parameter_values=param,
+                         experiment=experiment, solver=solver)
+
+print(f"Running {N_CYCLES}-cycle simulation …")
+sol = sim.solve()
+print("Simulation complete.\n")
+
+# ── 5. Extract discharge capacity per cycle ───────────────────────────────────
+cycles     = sol.cycles
+capacities = np.full(len(cycles), np.nan)
+
+for i, cyc in enumerate(cycles):
+    for step_idx in range(len(cyc.steps)):
+        step = cyc.steps[step_idx]
+        for key in ["Discharge capacity [A.h]", "Throughput capacity [A.h]"]:
+            try:
+                val = step[key].entries
+                if len(val) > 0 and not np.isnan(val[-1]):
+                    capacities[i] = abs(val[-1])
+                    break
+            except Exception:
+                continue
+        if not np.isnan(capacities[i]):
+            break
+    # fallback: integrate current
+    if np.isnan(capacities[i]):
+        try:
+            t = cyc.steps[0]["Time [s]"].entries
+            I = cyc.steps[0]["Current [A]"].entries
+            capacities[i] = abs(np.trapz(I, t)) / 3600.0
+        except Exception:
+            pass
+
+valid         = ~np.isnan(capacities)
+capacities    = capacities[valid]
+cycle_numbers = np.arange(1, len(capacities) + 1)
+cap_pct       = (capacities / capacities[0]) * 100.0
+
+print(f"Simulated cycles : {len(capacities)}")
+print(f"Initial capacity : {capacities[0]*1000:.3f} mAh")
+print(f"Final capacity   : {capacities[-1]*1000:.3f} mAh  ({cap_pct[-1]:.2f} %)")
+
+# ── 6. Plot ───────────────────────────────────────────────────────────────────
+fig, ax = plt.subplots(figsize=(7, 5))
+
+ax.plot(cycle_numbers, cap_pct, color="red", lw=2, label="SD model")
+
+ax.set_xlabel("Cycle number", fontsize=13)
+ax.set_ylabel("Capacity (%)", fontsize=13)
+ax.set_title(f"Fig. 3(b) – SD model: Capacity fade ({len(capacities)} cycles)", fontsize=12)
+ax.set_xlim(0, len(capacities))
+ax.set_ylim(80, 101)
+ax.legend(fontsize=11)
+ax.grid(True, linestyle="--", alpha=0.4)
+
+plt.tight_layout()
+plt.savefig("fig3b_SD_model_50cycles.png", dpi=150, bbox_inches="tight")
+print("\nFigure saved → fig3b_SD_model_50cycles.png")
+plt.show()
