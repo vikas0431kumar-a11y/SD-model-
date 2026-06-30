@@ -1,0 +1,212 @@
+import pybamm
+import matplotlib.pyplot as plt
+
+# ==========================================================
+# DFN Model
+# ==========================================================
+model = pybamm.lithium_ion.DFN()
+
+# ==========================================================
+# Parameters
+# ==========================================================
+param = pybamm.ParameterValues("Chayambuka2022")
+param.update({
+        # Geometry
+        "Negative electrode thickness [m]"                       : 64e-6,
+        "Positive electrode thickness [m]"                       : 68e-6,
+        "Separator thickness [m]"                                : 25e-6,
+        "Electrode height [m]"                                   : 0.0159,
+        "Electrode width [m]"                                    : 0.0159,
+        # Negative electrode
+        "Negative electrode active material volume fraction"     : 1 - 0.51 - 0.001,
+        "Negative electrode porosity"                            : 0.51,
+        "Negative particle radius [m]"                           : 3.48e-6,
+        "Maximum concentration in negative electrode [mol.m-3]" : 14540.0,
+        "Initial concentration in negative electrode [mol.m-3]" : 14520.0,
+        "Negative electrode conductivity [S.m-1]"               : 256.0,
+        "Negative electrode Bruggeman coefficient (electrolyte)" : 1.5,
+        "Negative electrode Bruggeman coefficient (electrode)"   : 1.5,
+        # Positive electrode
+        "Positive electrode active material volume fraction"     : 1 - 0.23 - 0.22,
+        "Positive electrode porosity"                            : 0.23,
+        "Positive particle radius [m]"                           : 0.59e-6,
+        "Maximum concentration in positive electrode [mol.m-3]" : 15320.0,
+        "Initial concentration in positive electrode [mol.m-3]" : 3320.0,
+        "Positive electrode conductivity [S.m-1]"               : 50.0,
+        "Positive electrode Bruggeman coefficient (electrolyte)" : 1.5,
+        "Positive electrode Bruggeman coefficient (electrode)"   : 1.5,
+
+        "Nominal cell capacity [A.h]"                           : 2.8e-3,
+        "Lower voltage cutoff [V]"                              : 2.0,
+        "Upper voltage cutoff [V]"                              : 4.15,
+        "Ambient temperature [K]"                               : 298.15,
+        "Initial temperature [K]"                               : 298.15,
+    })
+
+# ==========================================================
+# Cell Area
+# ==========================================================
+area = (
+    param["Electrode width [m]"]
+    * param["Electrode height [m]"]
+)
+
+# ==========================================================
+# Current Densities
+# ==========================================================
+current_densities = [1, 8.57, 12]  # A/m²
+
+# Corresponding C-rates
+c_rates = [0.1, 1.0, 1.4]
+
+# ==========================================================
+# Simulations
+# ==========================================================
+solutions = []
+
+for j in current_densities:
+
+    current = j * area
+
+    experiment = pybamm.Experiment([
+        f"Discharge at {current} A until 2.0 V"
+    ])
+
+    sim = pybamm.Simulation(
+        model,
+        parameter_values=param,
+        experiment=experiment,
+    )
+
+    sol = sim.solve()
+
+    solutions.append(sol)
+
+# ==========================================================
+# Experimental Data (approximate from Fig. 3a)
+# ==========================================================
+
+cap_exp_01 = [0.0,0.2,0.5,0.8,1.0,1.2,1.4,1.6,1.8,2.0,2.2,2.4,2.6,2.7,2.8]
+vol_exp_01 = [4.12,4.11,4.09,4.07,4.05,4.00,3.75,3.50,3.40,3.30,3.15,2.95,2.70,2.45,2.05]
+
+cap_exp_10 = [0.0,0.3,0.6,0.9,1.1,1.3,1.5,1.7,1.9,2.1,2.2,2.3,2.35]
+vol_exp_10 = [4.00,3.97,3.95,3.92,3.85,3.55,3.30,3.20,3.05,2.80,2.55,2.25,2.00]
+
+cap_exp_14 = [0.0,0.3,0.6,0.9,1.1,1.3,1.5,1.7,1.9,2.0,2.1,2.15]
+vol_exp_14 = [3.92,3.90,3.87,3.80,3.70,3.30,3.15,3.00,2.75,2.55,2.30,2.00]
+
+# ==========================================================
+# Plot Formatting (Paper Style)
+# ==========================================================
+plt.rcParams.update({
+    "font.family": "Times New Roman",
+    "font.size": 14,
+    "axes.linewidth": 1.6,
+})
+
+fig, ax = plt.subplots(figsize=(5.0, 4.2))
+
+# Paper colors
+colors = [
+    "#f07d13",   # orange (0.1C)
+    "#5b1fa8",   # purple (1.0C)
+    "black"      # black (1.4C)
+]
+
+# Paper-like line styles
+linestyles = ["-", "-", "-"]
+
+# ==========================================================
+# Plot Curves
+# ==========================================================
+for sol, c_rate, color, ls in zip(
+        solutions,
+        c_rates,
+        colors,
+        linestyles):
+
+    capacity = (
+        sol["Discharge capacity [A.h]"].entries
+        * 1000
+    )
+
+    voltage = sol["Voltage [V]"].entries
+
+    ax.plot(
+        capacity,
+        voltage,
+        color=color,
+        linewidth=2.5,
+        linestyle=ls,
+        label=f"{c_rate:.1f}C"
+    )
+# ==========================================================
+# Experimental Points
+# ==========================================================
+
+
+# ==========================================================
+# Axis Labels
+# ==========================================================
+ax.set_xlabel(
+    "Discharge capacity (mAh)",
+    fontsize=18
+)
+
+ax.set_ylabel(
+    "Voltage (V)",
+    fontsize=18
+)
+
+# ==========================================================
+# Axis Limits
+# ==========================================================
+ax.set_xlim(0, 3.0)
+ax.set_ylim(2.0, 4.2)
+
+ax.set_yticks([2.0, 2.5, 3.0, 3.5, 4.0])
+
+# ==========================================================
+# Ticks
+# ==========================================================
+ax.tick_params(
+    axis='both',
+    which='major',
+    direction='out',
+    length=6,
+    width=1.4,
+    labelsize=14
+)
+
+ax.minorticks_on()
+
+ax.tick_params(
+    which='minor',
+    length=3,
+    width=1.0
+)
+
+# ==========================================================
+# Legend
+# ==========================================================
+legend = ax.legend(
+    loc="lower left",
+    fontsize=13,
+    frameon=True,
+    fancybox=False
+)
+
+legend.get_frame().set_facecolor("#eeeeee")
+legend.get_frame().set_edgecolor("black")
+legend.get_frame().set_linewidth(1)
+
+
+
+# ==========================================================
+# Spine Thickness
+# ==========================================================
+for spine in ax.spines.values():
+    spine.set_linewidth(1.6)
+
+plt.tight_layout()
+plt.show()
