@@ -1,0 +1,321 @@
+import warnings
+import numpy as np
+import matplotlib.pyplot as plt
+import pybamm
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# PARAMETERS
+# ============================================================
+ONE_CYCLE = (
+    "Discharge at 1C until 2.0V",
+    "Rest for 5 minutes",
+    "Charge at 1C until 4.15V",
+    "Hold at 4.15V until C/50",
+    "Rest for 5 minutes",
+)
+
+def make_param():
+    param = pybamm.ParameterValues("Chen2020")
+    param.update(pybamm.ParameterValues("Chayambuka2022"))
+    param.update({
+        "Negative electrode thickness [m]"                       : 64e-6,
+        "Positive electrode thickness [m]"                       : 68e-6,
+        "Separator thickness [m]"                                : 25e-6,
+        "Electrode height [m]"                                   : 0.0159,
+        "Electrode width [m]"                                    : 0.0159,
+        "Negative electrode active material volume fraction"     : 1 - 0.51 - 0.001,
+        "Negative electrode porosity"                            : 0.51,
+        "Negative particle radius [m]"                           : 3.48e-6,
+        "Maximum concentration in negative electrode [mol.m-3]" : 14540.0,
+        "Initial concentration in negative electrode [mol.m-3]" : 14520.0,
+        "Negative electrode conductivity [S.m-1]"               : 256.0,
+        "Negative electrode Bruggeman coefficient (electrolyte)" : 1.5,
+        "Negative electrode Bruggeman coefficient (electrode)"   : 1.5,
+        "Positive electrode active material volume fraction"     : 1 - 0.23 - 0.22,
+        "Positive electrode porosity"                            : 0.23,
+        "Positive particle radius [m]"                           : 0.59e-6,
+        "Maximum concentration in positive electrode [mol.m-3]" : 15320.0,
+        "Initial concentration in positive electrode [mol.m-3]" : 3320.0,
+        "Positive electrode conductivity [S.m-1]"               : 50.0,
+        "Positive electrode Bruggeman coefficient (electrolyte)" : 1.5,
+        "Positive electrode Bruggeman coefficient (electrode)"   : 1.5,
+        "Separator porosity"                                     : 0.55,
+        "Cation transference number"                             : 0.45,
+        "Initial concentration in electrolyte [mol.m-3]"        : 1000.0,
+        "Nominal cell capacity [A.h]"                           : 2.8e-3,
+        "Lower voltage cutoff [V]"                              : 2.0,
+        "Upper voltage cutoff [V]"                              : 4.15,
+        "Ambient temperature [K]"                               : 298.15,
+        "Initial temperature [K]"                               : 298.15,
+        "SEI solvent diffusivity [m2.s-1]"                      : 150e-24,
+        "SEI partial molar volume [m3.mol-1]"                   : 5.72e-5,
+        "SEI resistivity [Ohm.m]"                               : 2e5,
+        "Bulk solvent concentration [mol.m-3]"                  : 7500.0,
+        "Initial SEI thickness [m]"                             : 1e-9,
+        "SEI growth activation energy [J.mol-1]"                : 0.0,
+        "Ratio of lithium moles to SEI moles"                   : 2.0,
+    })
+    return param
+
+def extract_capacities(sol):
+    caps = np.full(len(sol.cycles), np.nan)
+    for i, cyc in enumerate(sol.cycles):
+        for step in cyc.steps:
+            for key in ["Discharge capacity [A.h]", "Throughput capacity [A.h]"]:
+                try:
+                    val = step[key].entries
+                    if len(val) > 0 and not np.isnan(val[-1]):
+                        caps[i] = abs(val[-1])
+                        break
+                except Exception:
+                    continue
+            if not np.isnan(caps[i]):
+                break
+        if np.isnan(caps[i]):
+            try:
+                t = cyc.steps[0]["Time [s]"].entries
+                I = cyc.steps[0]["Current [A]"].entries
+                caps[i] = abs(np.trapz(I, t)) / 3600.0
+            except Exception:
+                pass
+    valid = ~np.isnan(caps)
+    caps  = caps[valid]
+    cycs  = np.arange(1, len(caps) + 1)
+    pct   = caps / caps[0] * 100.0
+    return cycs, pct
+
+# ============================================================
+# extract SEI thickness and Na inventory loss
+# ============================================================
+def extract_sei_and_na(sol):
+    sei_list = []
+    na_list  = []
+    cyc_list = []
+
+    sei_key = None
+    na_key  = None
+
+    sei_candidates = [
+        "X-averaged negative SEI thickness [m]",
+        "X-averaged negative electrode sei thickness [m]",
+        "Negative electrode sei thickness [m]",
+    ]
+    na_candidates = [
+        "Loss of lithium inventory [%]",
+        "Total lithium lost to side reactions [mol]",
+        "Loss of capacity to SEI [A.h]",
+    ]
+
+    cyc0 = sol.cycles[0]
+    for key in sei_candidates:
+        try:
+            _ = cyc0[key].entries
+            sei_key = key
+            print(f"  SEI variable found: {sei_key}")
+            break
+        except Exception:
+            continue
+
+    for key in na_candidates:
+        try:
+            _ = cyc0[key].entries
+            na_key = key
+            print(f"  Na-loss variable found: {na_key}")
+            break
+        except Exception:
+            continue
+
+    if sei_key is None or na_key is None:
+        print("  Could not find SEI or Na-loss variable. Listing available keys...")
+        try:
+            for k in cyc0.keys():
+                if "sei" in k.lower() or "sodium" in k.lower() or "lithium" in k.lower():
+                    print(f"    {k}")
+        except Exception:
+            pass
+        return np.array([]), np.array([]), np.array([])
+
+    for i, cyc in enumerate(sol.cycles):
+        try:
+            sei = cyc[sei_key].entries[-1] * 1e9       # convert m → nm
+            na  = cyc[na_key].entries[-1]
+            sei_list.append(sei)
+            na_list.append(na)
+            cyc_list.append(i + 1)
+        except Exception:
+            continue
+
+    return np.array(cyc_list), np.array(sei_list), np.array(na_list)
+
+# ============================================================
+# SOLVER
+# ============================================================
+try:
+    solver = pybamm.IDAKLUSolver(atol=1e-4, rtol=1e-4)
+    print("Using IDAKLUSolver")
+except Exception:
+    solver = pybamm.CasadiSolver(mode="safe", atol=1e-4, rtol=1e-4,
+                                  extra_options={"max_num_steps": 20000})
+    print("Using CasadiSolver")
+
+# ============================================================
+# EXPERIMENT — use 1000 for Fig 4, 20 for quick test
+# ============================================================
+N_CYCLES = 1000  # change to 20 for quick test
+
+experiment = pybamm.Experiment(
+    [ONE_CYCLE] * N_CYCLES,
+    termination="80% capacity",
+)
+
+# Experimental data (for capacity plot)
+exp_cycles = np.array([  1, 100, 200, 300, 400, 500,
+                        600, 700, 800, 900,1000,1100,
+                       1200,1300,1400,1500])
+exp_cap    = np.array([100.0, 99.4, 98.8, 98.2, 97.7, 97.2,
+                        96.7,  96.1, 95.5, 94.9, 94.2, 93.2,
+                        92.1,  91.0, 89.9, 89.0])
+
+# ============================================================
+# RUN SIMULATION
+# ============================================================
+print("\nRunning SD model …")
+
+options = {
+    "SEI"                     : "solvent-diffusion limited",
+    "SEI porosity change"     : "false",
+    "lithium plating"         : "none",
+    "particle mechanics"      : "none",
+    "loss of active material" : "none",
+}
+
+model = pybamm.lithium_ion.DFN(options=options)
+sim   = pybamm.Simulation(
+            model,
+            parameter_values=make_param(),
+            experiment=experiment,
+            solver=solver,
+        )
+sol = sim.solve(save_at_cycles=1)
+
+# Capacity
+cycs, pct = extract_capacities(sol)
+print(f"  cycles={len(cycs)} | final={pct[-1]:.2f}%")
+
+# SEI thickness + Na inventory loss
+cycs_sei, sei_nm, na_pct = extract_sei_and_na(sol)
+
+# ============================================================
+# PLOT — Fig. 4 (a), (b), (c) — SD model
+# ============================================================
+fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+
+color = "red"
+
+# (a) Capacity (%)
+axs[0].plot(cycs, pct, color=color, linewidth=2, label="SD model")
+axs[0].scatter(exp_cycles, exp_cap, color="deeppink", s=60,
+               marker="x", linewidths=1.8, zorder=5, label="Experimental")
+axs[0].set_xlabel("Cycle number", fontsize=12)
+axs[0].set_ylabel("Capacity (%)", fontsize=12)
+axs[0].set_title("(a) Capacity fade", fontsize=12)
+axs[0].set_xlim(0, max(N_CYCLES, 1000))
+axs[0].set_ylim(80, 100)
+axs[0].set_yticks([80, 85, 90, 95, 100])
+axs[0].legend(fontsize=10)
+axs[0].grid(True, linestyle="--", alpha=0.4)
+
+# (b) SEI layer thickness (nm)
+if len(sei_nm) > 0:
+    axs[1].plot(cycs_sei, sei_nm, color=color, linewidth=2, label="SD model")
+axs[1].set_xlabel("Cycle number", fontsize=12)
+axs[1].set_ylabel("SEI layer thickness (nm)", fontsize=12)
+axs[1].set_title("(b) SEI layer thickness", fontsize=12)
+axs[1].set_xlim(0, max(N_CYCLES, 1000))
+axs[1].legend(fontsize=10)
+axs[1].set_ylim(0, 60)
+axs[1].set_yticks([0, 20, 40, 60])
+axs[1].grid(True, linestyle="--", alpha=0.4)
+
+# (c) Loss of sodium inventory (%)
+if len(na_pct) > 0:
+    axs[2].plot(cycs_sei, na_pct, color=color, linewidth=2, label="SD model")
+axs[2].set_xlabel("Cycle number", fontsize=12)
+axs[2].set_ylabel("Loss of sodium inventory (%)", fontsize=12)
+axs[2].set_title("(c) Loss of sodium", fontsize=12)
+axs[2].set_xlim(0, max(N_CYCLES, 1000))
+axs[2].set_ylim(0, 10)
+axs[2].set_yticks([0, 2, 4, 6, 8, 10])
+axs[2].legend(fontsize=10)
+axs[2].grid(True, linestyle="--", alpha=0.4)
+
+plt.suptitle("Predicting the Capacity fade, SEI layer thickness, Loss of sodium ",
+             fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.savefig("Fig4_SD_model.png", dpi=300, bbox_inches="tight")
+plt.show()
+print("\nSaved → Fig4_SD_model.png")
+
+# ============================================================
+# SUMMARY — Capacity Fade, SEI Thickness, Loss of Sodium
+# ============================================================
+
+print("\n========== FINAL SUMMARY ==========")
+
+# --- Capacity Fade ---
+if len(cycs) > 0:
+    print(f"Cycles completed       : {len(cycs)}")
+    print(f"Initial Capacity       : {pct[0]:.2f} %")
+    print(f"Final Capacity         : {pct[-1]:.2f} %")
+    print(f"Total Capacity Fade    : {100 - pct[-1]:.2f} %")
+
+# --- SEI Thickness ---
+sei_final = []
+for i, cyc in enumerate(sol.cycles):
+    try:
+        sei = cyc["X-averaged negative SEI thickness [m]"].entries[-1] * 1e9
+        sei_final.append(sei)
+    except Exception:
+        continue
+
+if len(sei_final) > 0:
+    print(f"Initial SEI Thickness  : {sei_final[0]:.4f} nm")
+    print(f"Final SEI Thickness    : {sei_final[-1]:.4f} nm")
+    print(f"SEI Growth             : {sei_final[-1] - sei_final[0]:.4f} nm")
+
+# --- Loss of Sodium Inventory ---
+na_candidates = [
+    "Loss of lithium inventory [%]",
+    "Total lithium lost to side reactions [mol]",
+    "Loss of capacity to SEI [A.h]",
+    "Loss of lithium to SEI [mol]",
+]
+
+na_found = False
+for na_key in na_candidates:
+    na_vals = []
+    for i, cyc in enumerate(sol.cycles):
+        try:
+            val = cyc[na_key].entries[-1]
+            na_vals.append(val)
+        except Exception:
+            continue
+    if len(na_vals) > 0:
+        print(f"Na Loss Variable       : {na_key}")
+        print(f"Initial Na Loss        : {na_vals[0]:.4f}")
+        print(f"Final Na Loss          : {na_vals[-1]:.4f}")
+        na_found = True
+        break
+
+if not na_found:
+    print("Na inventory variable not found. Available SEI/Na keys:")
+    try:
+        for k in sol.cycles[0].keys():
+            if any(x in k.lower() for x in ["sei", "sodium", "lithium", "loss"]):
+                print(f"  {k}")
+    except Exception:
+        pass
+
+print("====================================")
