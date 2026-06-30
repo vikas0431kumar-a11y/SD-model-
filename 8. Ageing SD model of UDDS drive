@@ -1,0 +1,247 @@
+
+
+%matplotlib inline
+import warnings, numpy as np, matplotlib.pyplot as plt
+import pybamm, pandas as pd
+warnings.filterwarnings("ignore")
+
+# ── 1. UDDS — decimated 5× ────────────────────────────────────
+udds_path    = pybamm.DataLoader().get_data("UDDS.csv")
+raw          = pd.read_csv(str(udds_path), comment="#", header=None).to_numpy()
+udds_time    = raw[:, 0].astype(float)
+udds_current = raw[:, 1].astype(float)
+
+DECIMATE     = 5
+udds_time    = udds_time[::DECIMATE]
+udds_current = udds_current[::DECIMATE]
+UDDS_DUR     = float(udds_time[-1])          # ~1369 s
+
+C_NOM = 2.8
+I_MAX = 1.5 * C_NOM
+peak  = np.max(np.abs(udds_current))
+udds_scaled = udds_current * (I_MAX / peak)
+udds_array  = np.column_stack([udds_time, udds_scaled])
+
+# ── 2. MODEL — SD + reversible plating ───────────────────────
+options = {
+    "SEI"                            : "solvent-diffusion limited",
+    "SEI porosity change"            : "false",
+    "lithium plating"                : "reversible",   # reversible + dead Na decay
+    "lithium plating porosity change": "false",
+    "particle mechanics"             : "none",
+    "loss of active material"        : "none",
+    "thermal"                        : "isothermal",
+}
+model = pybamm.lithium_ion.DFN(options=options)
+
+# ── 3. PARAMETERS ─────────────────────────────────────────────
+param = pybamm.ParameterValues("Chayambuka2022")
+param.update({
+    # Geometry
+    "Negative electrode thickness [m]"                       : 64e-6,
+    "Positive electrode thickness [m]"                       : 68e-6,
+    "Separator thickness [m]"                                : 25e-6,
+    "Electrode height [m]"                                   : 0.16,
+    "Electrode width [m]"                                    : 1.60,
+    # Negative electrode
+    "Negative electrode porosity"                            : 0.51,
+    "Negative electrode active material volume fraction"     : 1 - 0.51 - 0.001,
+    "Negative particle radius [m]"                           : 3.48e-6,
+    "Maximum concentration in negative electrode [mol.m-3]" : 14540.0,
+    "Initial concentration in negative electrode [mol.m-3]" : 14520.0,
+    "Negative electrode conductivity [S.m-1]"               : 256.0,
+    "Negative electrode Bruggeman coefficient (electrolyte)" : 1.5,
+    "Negative electrode Bruggeman coefficient (electrode)"   : 1.5,
+    # Positive electrode
+    "Positive electrode porosity"                            : 0.23,
+    "Positive electrode active material volume fraction"     : 1 - 0.23 - 0.22,
+    "Positive particle radius [m]"                           : 0.59e-6,
+    "Maximum concentration in positive electrode [mol.m-3]" : 15320.0,
+    "Initial concentration in positive electrode [mol.m-3]" : 3320.0,
+    "Positive electrode conductivity [S.m-1]"               : 50.0,
+    "Positive electrode Bruggeman coefficient (electrolyte)" : 1.5,
+    "Positive electrode Bruggeman coefficient (electrode)"   : 1.5,
+    # Separator & electrolyte
+    "Separator porosity"                                     : 0.55,
+    "Cation transference number"                             : 0.45,
+    "Initial concentration in electrolyte [mol.m-3]"        : 1000.0,
+    # Cell
+    "Nominal cell capacity [A.h]"                           : C_NOM,
+    "Lower voltage cutoff [V]"                              : 2.0,
+    "Upper voltage cutoff [V]"                              : 4.15,
+    "Ambient temperature [K]"                               : 298.15,
+    "Initial temperature [K]"                               : 298.15,
+    # SEI — SD model key parameter: Dsd = 80.5e-24 m2/s (Table 3 in paper)
+    "SEI solvent diffusivity [m2.s-1]"                      : 80.5e-24,
+    "SEI partial molar volume [m3.mol-1]"                   : 5.72e-5,
+    "SEI resistivity [Ohm.m]"                               : 2e5,
+    "Bulk solvent concentration [mol.m-3]"                  : 7500.0,
+    "Initial SEI thickness [m]"                             : 1e-9,
+    "SEI growth activation energy [J.mol-1]"                : 0.0,
+    "Ratio of lithium moles to SEI moles"                   : 2.0,
+    "SEI reaction exchange current density [A.m-2]"         : 5.7e-7,
+    "SEI open-circuit potential [V]"                        : 0.4,
+    # Sodium plating — reversible, kpl = 1e-13 m/s (paper Section 3.1)
+    "Lithium plating kinetic rate constant [m.s-1]"         : 1e-13,
+    "Dead lithium decay constant [s-1]"                     : 1e-3,   # λ₀ = 1e-3 s⁻¹
+    "Lithium plating transfer coefficient"                   : 0.5,
+    "Typical plated lithium concentration [mol.m-3]"        : 1000.0,
+    "Initial plated lithium concentration [mol.m-3]"        : 0.0,
+    "Initial dead lithium concentration [mol.m-3]"          : 0.0,
+    "Exchange-current density for plating [A.m-2]"          : 5e-10,
+    "Exchange-current density for stripping [A.m-2]"        : 5e-10,
+}, check_already_exists=False)
+
+# ── 4. EXPERIMENT — AGEING protocol (paper Section 3.1) ───────
+# Per day:
+#   Drive → 3h rest → Drive → 3h rest → Drive → 3h rest → Drive
+#   → CC charge 0.3C to 4.05V → CV hold until C/100
+#   → overnight rest until next day
+#
+# Total day ≈ 4×1369s drives + 3×10800s rests + charge + overnight
+# The prolonged rest at 4.05V is what drives accelerated degradation.
+
+N_DAYS = 365
+
+udds_step = pybamm.step.current(udds_array, duration=UDDS_DUR,
+                                 description="UDDS")
+
+AGEING_BLOCK = (
+    udds_step,
+    "Rest for 3 hours",
+    udds_step,
+    "Rest for 3 hours",
+    udds_step,
+    "Rest for 3 hours",
+    udds_step,
+    "Charge at 0.3C until 4.05V",
+    "Hold at 4.05V until C/100",
+    "Rest for 12 hours",   # overnight rest at high voltage → key ageing driver
+)
+
+experiment = pybamm.Experiment(
+    [AGEING_BLOCK] * N_DAYS,
+    termination="80% capacity",
+)
+
+# ── 5. SOLVER ─────────────────────────────────────────────────
+try:
+    solver = pybamm.IDAKLUSolver(atol=1e-3, rtol=1e-3)
+    print("IDAKLUSolver (fast)")
+except Exception:
+    solver = pybamm.CasadiSolver(
+        mode="fast with events",
+        atol=1e-3, rtol=1e-3,
+        extra_options={"max_num_steps": 30000},
+    )
+    print("CasadiSolver fast-with-events")
+
+# ── 6. RUN ────────────────────────────────────────────────────
+SAVE_EVERY = 5
+print(f"[RUN] SD · Ageing UDDS · {N_DAYS} days …")
+sim = pybamm.Simulation(model, parameter_values=param,
+                         experiment=experiment, solver=solver)
+sol = sim.solve(save_at_cycles=SAVE_EVERY)
+print(f"[DONE] {len(sol.cycles)} cycle objects stored")
+
+# ── 7. EXTRACT ────────────────────────────────────────────────
+SEI_KEYS = [
+    "X-averaged negative electrode SEI thickness [m]",
+    "X-averaged negative SEI thickness [m]",
+    "Negative electrode SEI thickness [m]",
+]
+NA_KEYS = [
+    "Loss of lithium inventory [%]",
+    "X-averaged loss of lithium inventory [%]",
+    "Total lithium lost to side reactions [mol]",
+]
+
+def find_key(cyc, keys):
+    for k in keys:
+        try:
+            if len(cyc[k].entries): return k
+        except: pass
+    return None
+
+cyc0    = sol.cycles[0]
+sei_key = find_key(cyc0, SEI_KEYS)
+na_key  = find_key(cyc0, NA_KEYS)
+print(f"SEI key : {sei_key}")
+print(f"Na  key : {na_key}")
+
+n   = len(sol.cycles)
+cap = np.full(n, np.nan)
+sei = np.full(n, np.nan)
+na  = np.full(n, np.nan)
+
+for i, cyc in enumerate(sol.cycles):
+    for ck in ["Discharge capacity [A.h]", "Throughput capacity [A.h]"]:
+        try:
+            v = cyc[ck].entries
+            if len(v): cap[i] = abs(float(v[-1])); break
+        except: pass
+    if sei_key:
+        try:
+            v = cyc[sei_key].entries
+            if len(v): sei[i] = float(v[-1]) * 1e9
+        except: pass
+    if na_key:
+        try:
+            v = cyc[na_key].entries
+            if len(v): na[i] = float(v[-1])
+        except: pass
+
+# Interpolate over saved indices
+saved_idx = np.where(~np.isnan(cap))[0]
+all_idx   = np.arange(n)
+cap_dense = np.interp(all_idx, saved_idx, cap[saved_idx])
+sei_dense = np.interp(all_idx, saved_idx, sei[saved_idx]) if ~np.all(np.isnan(sei)) else sei
+na_dense  = np.interp(all_idx, saved_idx, na[saved_idx])  if ~np.all(np.isnan(na))  else na
+
+cap_pct = cap_dense / cap_dense[0] * 100.0
+cycles  = np.arange(1, n + 1)
+
+# ── 8. PLOT — Fig 8(c) style ──────────────────────────────────
+fig, axes = plt.subplots(1, 2, figsize=(14, 4.5))
+
+def fmt(ax, ylabel, ylim, yticks):
+    ax.set_xlabel("Cycle number", fontsize=12, fontweight="bold")
+    ax.set_ylabel(ylabel, fontsize=11, fontweight="bold")
+    ax.set_xlim(0, n + 1)
+    ax.set_ylim(ylim)
+    ax.set_yticks(yticks)
+    ax.tick_params(axis="both", labelsize=10, direction="in",
+                   width=1.3, length=4, top=True, right=True)
+    for sp in ax.spines.values(): sp.set_linewidth(1.3)
+    ax.grid(True, ls="--", alpha=0.35)
+
+cap_final = float(np.nanmin(cap_pct))
+
+sei_final = float(np.nanmax(sei_dense))
+axes[0].plot(cycles, sei_dense, color="red", lw=2, ls="-",
+             label=f"SD = {sei_final:.2f} nm")
+fmt(axes[0], "SEI layer thickness (nm)", (0, 60), [0, 20, 40, 60])
+axes[0].legend(fontsize=10, loc="upper left", frameon=True, framealpha=0.9)
+
+na_final = float(np.nanmax(na_dense))
+axes[1].plot(cycles, na_dense, color="red", lw=2, ls="-",
+             label=f"SD = {na_final:.2f} %")
+fmt(axes[1], "Sodium inventory loss (%)", (0, 10), [0, 2, 4, 6, 8, 10])
+axes[1].legend(fontsize=10, loc="upper left", frameon=True, framealpha=0.9)
+
+plt.suptitle("Fig 8(c) — SD Model · Ageing · UDDS Drive Cycle",
+             fontsize=13, fontweight="bold", y=1.01)
+plt.tight_layout()
+plt.savefig("fig8c_SD_ageing_UDDS.png", dpi=300, bbox_inches="tight")
+print("\n[SAVED] fig8c_SD_ageing_UDDS.png")
+plt.show()
+
+# ── 9. SUMMARY ────────────────────────────────────────────────
+print("\n" + "="*55)
+print("SUMMARY  —  SD model · Ageing UDDS  [Fig 8(c)]")
+print("="*55)
+print(f"  Days completed   : {n}")
+print(f"  Capacity         : {cap_final:.2f} %   (paper: 88.74 %)")
+print(f"  SEI thickness    : {sei_final:.2f} nm  (paper: 44.31 nm)")
+print(f"  Na loss          : {na_final:.3f} %   (paper: 7.44 %)")
+print("="*55)
